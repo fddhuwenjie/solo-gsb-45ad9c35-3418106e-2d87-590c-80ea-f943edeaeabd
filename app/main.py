@@ -1,4 +1,4 @@
-"""FastAPI 入口：POST /convert 速度图换算；谱例修订；排练提示领取。
+"""FastAPI 入口：POST /convert 速度图换算；谱例修订；排练提示领取；排练批注。
 
 启动：uvicorn app.main:app --host 0.0.0.0 --port 8000
 """
@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .db import (
+    AnnotationMismatch,
     ElapsedRegression,
     OriginMismatch,
     RehearsalNotFound,
@@ -34,8 +35,11 @@ app = FastAPI(
         "（进度只前进，发放记录含所用修订号）；排练中途可定位（跳转）到"
         "另一乐谱位置：提交当前已领取累计秒数与目标位置，目标之前的未发"
         "提示记为跳过，此后提示按目标到提示的速度图时长相对该累计秒数定时。"
+        "排练现场还可在当前领取进度处登记文字批注：提交等于当前进度的"
+        "累计秒数与非空文字，按当前定位起点与已提交速度图反推乐谱位置"
+        "（量化到最近 tick）并记录所用修订号，可按登记先后查询。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 # SQLite 持久化（默认 ./data/tempo.db，可用 TEMPO_DB_PATH 覆盖；
@@ -1049,6 +1053,149 @@ async def locate_rehearsal(rehearsal_id: str, req: LocateRequest):
         skipped=skipped,
         cues=result["rehearsal"]["cues"],
     )
+
+
+# ---------------------------------------------------------------------- #
+# 排练批注：在当前领取进度处登记文字批注 / 按登记先后查询
+# ---------------------------------------------------------------------- #
+class AnnotationCreateRequest(BaseModel):
+    elapsed_seconds: float = Field(
+        ...,
+        description=(
+            "当前已领取的累计秒数（非负、有限）；必须与排练当前进度"
+            "完全相等，否则返回 409 且不写入"
+        ),
+    )
+    text: str = Field(..., description="批注文字（去除空白后不能为空）")
+
+
+class AnnotationOut(BaseModel):
+    id: str = Field(..., description="批注 ID")
+    text: str = Field(..., description="批注文字")
+    elapsed_seconds: float = Field(..., description="登记时提交的累计秒数")
+    position: str = Field(
+        ..., description="反推并量化到最近 tick 后的乐谱位置 小节:拍:tick"
+    )
+    total_ticks: int = Field(..., description="批注位置距乐谱起点的 tick 坐标")
+    revision: int = Field(
+        ..., description="反推计算所用速度图修订号（登记时谱例的当前修订）"
+    )
+
+
+class AnnotationListOut(BaseModel):
+    id: str = Field(..., description="排练 ID")
+    annotations: list[AnnotationOut] = Field(
+        ..., description="全部批注，按登记先后排列"
+    )
+
+
+def _annotation_mismatch(exc: AnnotationMismatch) -> JSONResponse:
+    # 批注秒数不等于当前领取进度：409，不写入任何内容。
+    detail = {
+        "loc": ["body", "elapsed_seconds"],
+        "msg": (
+            f"批注秒数必须等于当前已领取进度：本次 {exc.elapsed}s，"
+            f"已领取进度 {exc.last_elapsed}s"
+        ),
+        "index": None,
+        "elapsed_seconds": exc.elapsed,
+        "last_elapsed_seconds": exc.last_elapsed,
+    }
+    return _error_response([detail], status_code=409)
+
+
+def _annotation_score_position(score: dict, elapsed: float) -> dict:
+    """把批注的累计秒数反推为乐谱位置（纯计算，量化到最近 tick）。
+
+    以排练当前定位起点为锚：图内秒数 = 起点位置的图内秒数 +
+    （提交秒数 - 起点累计秒数），再按当前已提交速度图反解为 tick 并
+    四舍五入量化。未定位的排练起点为 (tick 0, 0.0s)，退化为从乐谱起点
+    算；刚定位的同一秒（提交秒数 == 起点累计秒数）恰好落在目标位置。
+
+    本函数作为纯计算回调在 :meth:`Store.create_annotation` 的写事务内
+    执行，``score`` 即该事务快照中的当前修订，保证进度、起点和速度图
+    取自同一已提交状态。
+    """
+    tmap = _build_map(
+        score["ppq"], score["time_signatures"], score["tempo_points"]
+    )
+    map_seconds = (
+        tmap.seconds_at_tick(score.get("origin_ticks", 0))
+        + elapsed
+        - score.get("origin_elapsed", 0.0)
+    )
+    raw_ticks = tmap.tick_at_seconds(map_seconds)
+    total_ticks = int(math.floor(raw_ticks + 0.5))
+    return {
+        "position": str(tmap.ticks_to_mbt(total_ticks)),
+        "total_ticks": total_ticks,
+    }
+
+
+@app.post(
+    "/rehearsals/{rehearsal_id}/annotations",
+    response_model=AnnotationOut,
+    status_code=201,
+)
+async def create_annotation(rehearsal_id: str, req: AnnotationCreateRequest):
+    """在当前领取进度处登记文字批注，返回它指向的乐谱位置。
+
+    提交秒数必须等于当前已领取进度（否则 409 且不写入）；位置按当前
+    定位起点与谱例当前已提交速度图反推、量化到最近 tick，与计算所用
+    修订号一起保存——之后发布或再次定位都不会改变既有批注。
+    """
+    elapsed = req.elapsed_seconds
+    if not (
+        isinstance(elapsed, (int, float))
+        and not isinstance(elapsed, bool)
+        and math.isfinite(elapsed)
+        and elapsed >= 0
+    ):
+        raise TempoMapError(
+            [
+                {
+                    "loc": ["body", "elapsed_seconds"],
+                    "msg": "elapsed_seconds 必须是有限的非负数",
+                    "index": None,
+                }
+            ]
+        )
+    if not req.text.strip():
+        raise TempoMapError(
+            [
+                {
+                    "loc": ["body", "text"],
+                    "msg": "批注文字不能为空",
+                    "index": None,
+                }
+            ]
+        )
+    elapsed_value = float(elapsed)
+
+    try:
+        result = store.create_annotation(
+            rehearsal_id, elapsed_value, req.text, _annotation_score_position
+        )
+    except RehearsalNotFound:
+        return _rehearsal_not_found(rehearsal_id)
+    except AnnotationMismatch as exc:
+        return _annotation_mismatch(exc)
+    except ScoreNotFound as exc:  # 防御性：谱例被删（正常不会发生）
+        return _not_found(str(exc))
+    return AnnotationOut.model_validate(result)
+
+
+@app.get(
+    "/rehearsals/{rehearsal_id}/annotations",
+    response_model=AnnotationListOut,
+)
+async def list_annotations(rehearsal_id: str):
+    """按登记先后查询排练的全部批注（位置与修订号为登记时的冻结值）。"""
+    try:
+        annotations = store.get_annotations(rehearsal_id)
+    except RehearsalNotFound:
+        return _rehearsal_not_found(rehearsal_id)
+    return AnnotationListOut(id=rehearsal_id, annotations=annotations)
 
 
 @app.get("/rehearsals/{rehearsal_id}", response_model=RehearsalOut)

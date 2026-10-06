@@ -18,7 +18,11 @@
   同一提示最多发放一次；
 * ``cue_skips``：定位跳过记录（定位时该修订号），主键
   ``(rehearsal_id, cue_index)`` 兜底保证同一提示最多跳过一次，且与
-  ``cue_deliveries`` 互斥。
+  ``cue_deliveries`` 互斥；
+* ``annotations``：排练批注（文字、登记时的累计秒数、由定位起点与
+  当前已提交速度图反推并量化到最近 tick 的乐谱位置与 tick 坐标、
+  计算所用修订号，以及排练内登记序号 ``seq``）；登记后不再随发布
+  或再次定位改变，查询按登记先后（``seq``）返回。
 
 发布是单事务：``BEGIN IMMEDIATE`` 取得写锁后按 revision 做乐观并发控制
 （预期修订号不匹配 -> 409），成功则一次更新速度图、未锁定锚点秒数和
@@ -38,6 +42,14 @@
 速度图：待发提示按最新修订重算触发秒数，而定位起点（tick/累计秒数）、
 已发记录与跳过状态都保持不变。定位/领取/发布共用同一把写锁串行化，
 同一条提示不可能既跳过又发放。
+
+批注（``create_annotation``）也是单事务：提交的累计秒数必须**等于**
+已领取进度（否则 :class:`AnnotationMismatch` -> 409，不写入），随后在
+同一快照内读出定位起点与谱例当前已提交速度图，由注入的纯计算回调把
+累计秒数反推为乐谱位置（量化到最近 tick），连同计算所用修订号一起
+写入——**进度、起点和速度图必然取自同一已提交状态**；与领取/定位/
+发布交错时必居其一。登记只追加不修改：发布或再次定位后，既有批注的
+位置与修订号保持登记时的值。
 
 查询同样是单事务：``GET /scores`` / ``GET /rehearsals`` 在同一显式读
 事务内读取主行与全部明细行，二者共用一个已提交快照，避免与发布/领取
@@ -118,6 +130,20 @@ CREATE TABLE IF NOT EXISTS cue_skips (
     FOREIGN KEY (rehearsal_id, cue_index)
         REFERENCES rehearsal_cues(rehearsal_id, cue_index) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS annotations (
+    id              TEXT PRIMARY KEY,
+    rehearsal_id    TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    text            TEXT NOT NULL,
+    elapsed_seconds REAL NOT NULL,
+    position        TEXT NOT NULL,
+    total_ticks     INTEGER NOT NULL,
+    revision        INTEGER NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (rehearsal_id, seq),
+    FOREIGN KEY (rehearsal_id) REFERENCES rehearsals(id) ON DELETE CASCADE
+);
 """
 
 
@@ -157,6 +183,18 @@ class OriginMismatch(Exception):
         self.last_elapsed = last_elapsed
         super().__init__(
             f"定位秒数必须等于当前已领取进度：提交 {elapsed}，"
+            f"已领取到 {last_elapsed}"
+        )
+
+
+class AnnotationMismatch(Exception):
+    """批注提交的累计秒数不等于当前已领取进度（-> 409，不写入）。"""
+
+    def __init__(self, elapsed: float, last_elapsed: float):
+        self.elapsed = elapsed
+        self.last_elapsed = last_elapsed
+        super().__init__(
+            f"批注秒数必须等于当前已领取进度：提交 {elapsed}，"
             f"已领取到 {last_elapsed}"
         )
 
@@ -649,6 +687,128 @@ class Store:
             "skipped": sorted(to_skip_set),
             "rehearsal": rehearsal,
         }
+
+    # ------------------------------------------------------------------ #
+    # 排练批注：登记（按当前进度反推乐谱位置）/ 按登记先后查询
+    # ------------------------------------------------------------------ #
+    def create_annotation(
+        self,
+        rehearsal_id: str,
+        elapsed: float,
+        text: str,
+        compute: Callable[[dict, float], dict],
+    ) -> dict:
+        """单事务登记批注：校验进度、按同一快照反推位置、写入并返回。
+
+        ``elapsed`` 必须**等于**排练当前已领取进度（``last_elapsed``），
+        否则抛 :class:`AnnotationMismatch`（-> 409），不写入任何内容；
+        排练不存在 -> :class:`RehearsalNotFound`。
+
+        ``compute(score, elapsed)`` 是引擎层注入的纯计算回调：在
+        ``BEGIN IMMEDIATE`` 事务内、基于本事务快照读出的定位起点
+        （``origin_ticks`` / ``origin_elapsed``）与谱例当前已提交速度图，
+        把累计秒数反推为乐谱位置并量化到最近 tick，返回
+        ``{"position": ..., "total_ticks": ...}``。读-算-写在同一写事务
+        内完成，与领取/定位/发布交错时必居其一，故**进度、起点和速度图
+        必然取自同一已提交状态**，写入的修订号即计算所用修订号。
+
+        登记只追加（``seq`` 为排练内递增的登记序号），不推进领取进度、
+        不影响提示发放/跳过状态；写入后批注不再随发布或再次定位改变。
+        """
+        with self._write_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM rehearsals WHERE id = ?", (rehearsal_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise RehearsalNotFound(rehearsal_id)
+            if elapsed != row["last_elapsed"]:
+                conn.rollback()
+                raise AnnotationMismatch(elapsed, row["last_elapsed"])
+
+            score_row = conn.execute(
+                "SELECT * FROM scores WHERE id = ?", (row["score_id"],)
+            ).fetchone()
+            if score_row is None:  # 外键保证不会发生；防御性处理
+                conn.rollback()
+                raise ScoreNotFound(row["score_id"])
+            revision = score_row["revision"]
+            score = {
+                "id": score_row["id"],
+                "ppq": score_row["ppq"],
+                "time_signatures": json.loads(score_row["time_signatures"]),
+                "tempo_points": json.loads(score_row["tempo_points"]),
+                "revision": revision,
+                "origin_ticks": row["origin_ticks"],
+                "origin_elapsed": row["origin_elapsed"],
+            }
+            # 纯计算：在同一快照/同一修订下反推乐谱位置（量化到最近 tick）。
+            computed = compute(score, elapsed)
+
+            annotation_id = new_id()
+            seq = conn.execute(
+                "SELECT COALESCE(MAX(seq) + 1, 0) FROM annotations "
+                "WHERE rehearsal_id = ?",
+                (rehearsal_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO annotations "
+                "(id, rehearsal_id, seq, text, elapsed_seconds, position, "
+                " total_ticks, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    annotation_id,
+                    rehearsal_id,
+                    seq,
+                    text,
+                    elapsed,
+                    computed["position"],
+                    computed["total_ticks"],
+                    revision,
+                ),
+            )
+            conn.commit()
+        return {
+            "id": annotation_id,
+            "rehearsal_id": rehearsal_id,
+            "text": text,
+            "elapsed_seconds": elapsed,
+            "position": computed["position"],
+            "total_ticks": computed["total_ticks"],
+            "revision": revision,
+        }
+
+    def get_annotations(self, rehearsal_id: str) -> list[dict]:
+        """按登记先后（``seq``）返回排练的全部批注。
+
+        排练不存在抛 :class:`RehearsalNotFound`。批注在登记时冻结，
+        此处原样返回落库值：发布或再次定位后位置与修订号不变。
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT id FROM rehearsals WHERE id = ?", (rehearsal_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise RehearsalNotFound(rehearsal_id)
+            rows = conn.execute(
+                "SELECT * FROM annotations WHERE rehearsal_id = ? ORDER BY seq",
+                (rehearsal_id,),
+            ).fetchall()
+            conn.commit()
+        return [
+            {
+                "id": r["id"],
+                "rehearsal_id": r["rehearsal_id"],
+                "text": r["text"],
+                "elapsed_seconds": r["elapsed_seconds"],
+                "position": r["position"],
+                "total_ticks": r["total_ticks"],
+                "revision": r["revision"],
+            }
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------ #
     @staticmethod

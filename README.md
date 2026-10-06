@@ -22,6 +22,16 @@
 而已发记录、跳过状态与定位起点不变。排练、发放与跳过记录同样保存在
 SQLite，重启后可继续领取。
 
+排练现场还可以在**当前领取进度**处登记**文字批注**：提交等于当前进度
+的累计秒数（有限非负，否则 **422**；不等于进度 **409** 且不写入）与
+非空文字，服务端按**当前定位起点**与谱例**当前已提交速度图**把秒数
+反推为乐谱位置（未定位时从乐谱起点算，刚定位的同一秒落在目标位置），
+**量化到最近 tick**，返回并保存批注 ID、文字、累计秒数、乐谱位置、
+tick 坐标与**计算所用修订号**；登记与领取/定位/发布在同一写事务内
+串行化，进度、起点和速度图必然取自同一已提交状态。批注可**按登记
+先后查询**；速度图发布或再次定位后，既有批注的位置与修订号保持
+登记时的值。
+
 - 位置中的“拍”按**当前拍号分母**对应的音符计（6/8 中一拍 = 八分音符）；
 - 内部统一展开为“距乐谱起点的 **tick 坐标**”（PPQ：每四分音符的 tick 数）；
 - 线性速度段按解析积分换算，反向换算在**同一速度段内解析求逆**；
@@ -39,6 +49,7 @@ SQLite，重启后可继续领取。
 - [接口地址与交互式文档](#接口地址与交互式文档)
 - [录音锚点修订：创建 / 预览 / 发布](#录音锚点修订创建--预览--发布)
 - [排练提示：创建排练 / 领取到点提示 / 定位跳转](#排练提示创建排练--领取到点提示)
+- [排练批注：登记 / 按登记先后查询](#排练批注登记--按登记先后查询)
 - [约定与规则](#约定与规则)
 - [请求字段](#请求字段)
 - [响应字段](#响应字段)
@@ -70,6 +81,8 @@ docker compose up --build
 - 领取到点提示：`POST http://localhost:8000/rehearsals/{id}/claims`
 - 定位（跳转）：`POST http://localhost:8000/rehearsals/{id}/locate`
 - 查询排练：`GET  http://localhost:8000/rehearsals/{id}`
+- 登记批注：`POST http://localhost:8000/rehearsals/{id}/annotations`
+- 查询批注：`GET  http://localhost:8000/rehearsals/{id}/annotations`
 - Swagger 交互文档：<http://localhost:8000/docs>
 - ReDoc：<http://localhost:8000/redoc>
 - OpenAPI Schema：<http://localhost:8000/openapi.json>
@@ -589,6 +602,186 @@ curl -s http://localhost:8000/rehearsals/$RID2
 
 ---
 
+## 排练批注：登记 / 按登记先后查询
+
+适用于“排练现场在当前进度处记一条文字批注，事后回看它所指的乐谱
+位置”的场景。批注在**登记那一刻**按当前定位起点与谱例当前已提交
+速度图反推出乐谱位置并**冻结**，之后发布或再次定位都不会改变。
+
+### 规则
+
+1. **登记** `POST /rehearsals/{id}/annotations`：提交
+   `elapsed_seconds`（从排练开始累计的秒数）与 `text`（去空白后
+   非空，否则 **422**）。秒数必须是**有限的非负数**（否则 **422**）
+   且**等于当前已领取进度**（否则 **409**，响应体含
+   `elapsed_seconds` / `last_elapsed_seconds`，**不写入任何内容**）。
+   排练不存在返回 **404**。
+2. **位置反推**：图内秒数 = 定位起点位置的图内秒数 +（提交秒数 −
+   起点累计秒数），再按谱例**当前已提交速度图**反解为 tick 并
+   **四舍五入量化到最近 tick**。未定位的排练起点是 `1:1:0 / 0.0s`，
+   即从乐谱起点算；**刚定位的同一秒**（提交秒数 == 起点累计秒数）
+   恰好落在定位目标位置。
+3. **返回并保存**：批注 `id`、`text`、`elapsed_seconds`、乐谱位置
+   `position`（`小节:拍:tick`）、tick 坐标 `total_ticks` 与计算所用
+   速度图 `revision`。登记**不推进领取进度**、不影响提示发放/跳过。
+4. **一致性**：登记的读-算-写在**单个写事务**内完成，与领取、定位、
+   发布共用写锁串行化——**进度、起点和速度图必然取自同一已提交
+   状态**，写入的修订号即计算所用修订号。
+5. **冻结**：速度图发布或再次定位后，既有批注的 `position` /
+   `total_ticks` / `revision` 保持登记时的值；新登记的批注按那时的
+   起点与最新修订计算。
+6. **查询** `GET /rehearsals/{id}/annotations`：按**登记先后**返回
+   全部批注（与乐谱位置先后无关）。批注同样保存在 **SQLite**
+   （`annotations` 表，与谱例同库同卷；旧库打开时自动建表），
+   Compose 重启后仍可查询、可继续登记。
+
+### HTTP 调用示例
+
+> 本节自含完整流程（新建谱例与排练），在任意服务状态上按顺序粘贴
+> 即可跑通。谱例为 120 BPM、4/4、PPQ=480：一拍 0.5 s、一小节 2.0 s、
+> 一 tick `1/960` s。
+
+#### 0）准备：新建谱例与排练
+
+```bash
+SID=$(curl -s -X POST http://localhost:8000/scores \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ppq": 480,
+    "time_signatures": [],
+    "tempo_points": [{"position": "1:1:0", "bpm": 120, "curve": "step"}],
+    "anchors": [{"position": "1:1:0", "locked": true}]
+  }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+RID=$(curl -s -X POST http://localhost:8000/rehearsals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "score_id": "'$SID'",
+    "cues": [{"position": "2:1:0", "text": "进副歌"}]
+  }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+echo "谱例 ID：$SID  排练 ID：$RID"
+```
+
+#### 1）领取到 2.0 s，在当前进度处登记批注
+
+```bash
+curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.0}' > /dev/null
+
+curl -s -X POST http://localhost:8000/rehearsals/$RID/annotations \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.0, "text": "这里进副歌，弦乐轻一点"}'
+```
+
+120 BPM 下 2.0 s 即 `2:1:0`（tick 1920），返回 **201**：
+
+```json
+{
+  "id": "<批注 ID>",
+  "text": "这里进副歌，弦乐轻一点",
+  "elapsed_seconds": 2.0,
+  "position": "2:1:0",
+  "total_ticks": 1920,
+  "revision": 0
+}
+```
+
+#### 2）定位到 4:1:0 后的同一秒登记：批注落在目标位置
+
+```bash
+curl -s -X POST http://localhost:8000/rehearsals/$RID/locate \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.0, "position": "4:1:0"}' > /dev/null
+
+curl -s -X POST http://localhost:8000/rehearsals/$RID/annotations \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.0, "text": "从这里反复"}'
+```
+
+定位起点变为（`4:1:0` = 图内 6.0 s，累计 2.0 s），同一秒登记的批注
+恰好落在目标位置：`"position": "4:1:0", "total_ticks": 5760`。
+
+#### 3）进度推进到 3.0 s 再登记：按定位起点相对反推
+
+```bash
+curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 3.0}' > /dev/null
+
+curl -s -X POST http://localhost:8000/rehearsals/$RID/annotations \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 3.0, "text": "第三拍进"}'
+```
+
+图内秒数 = 起点 6.0 s +（3.0 − 2.0）= 7.0 s → tick 6720 →
+`"position": "4:3:0", "total_ticks": 6720`。
+
+秒数不等于当前进度时返回 **409** 且不写入（当前进度为 3.0 s）：
+
+```bash
+curl -i -X POST http://localhost:8000/rehearsals/$RID/annotations \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.5, "text": "错位"}'
+# HTTP/1.1 409 Conflict
+# {"detail": [{"loc": ["body", "elapsed_seconds"],
+#   "msg": "批注秒数必须等于当前已领取进度：本次 2.5s，已领取进度 3.0s",
+#   "index": null, "elapsed_seconds": 2.5, "last_elapsed_seconds": 3.0}]}
+```
+
+#### 4）发布新速度图：既有批注冻结，新批注按新修订计算
+
+把整体速度放慢到 60 BPM（谱例修订 0 → 1），进度推进到 5.0 s 再登记：
+
+```bash
+curl -s -X POST http://localhost:8000/scores/$SID/revisions/0/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"tempo_points": [{"position": "1:1:0", "bpm": 60, "curve": "step"}]}' > /dev/null
+
+curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 5.0}' > /dev/null
+
+curl -s -X POST http://localhost:8000/rehearsals/$RID/annotations \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 5.0, "text": "新速度下的笔记"}'
+```
+
+60 BPM 下起点 `4:1:0` 的图内秒数为 12.0 s，图内秒数 = 12.0 +
+（5.0 − 2.0）= 15.0 s → tick 7200，返回
+`"position": "4:4:0", "total_ticks": 7200, "revision": 1`。
+
+#### 5）按登记先后查询全部批注
+
+```bash
+curl -s http://localhost:8000/rehearsals/$RID/annotations
+```
+
+```json
+{
+  "id": "<排练 ID>",
+  "annotations": [
+    {"id": "...", "text": "这里进副歌，弦乐轻一点",
+     "elapsed_seconds": 2.0, "position": "2:1:0",
+     "total_ticks": 1920, "revision": 0},
+    {"id": "...", "text": "从这里反复",
+     "elapsed_seconds": 2.0, "position": "4:1:0",
+     "total_ticks": 5760, "revision": 0},
+    {"id": "...", "text": "第三拍进",
+     "elapsed_seconds": 3.0, "position": "4:3:0",
+     "total_ticks": 6720, "revision": 0},
+    {"id": "...", "text": "新速度下的笔记",
+     "elapsed_seconds": 5.0, "position": "4:4:0",
+     "total_ticks": 7200, "revision": 1}
+  ]
+}
+```
+
+前三条保持登记时（rev0 / 120 BPM）算出的位置与修订号——发布没有
+改变它们；第四条按发布后的 rev1 / 60 BPM 计算。列表顺序即登记
+先后，与乐谱位置先后无关。
+
+---
+
 ## 约定与规则
 
 ### 1. PPQ 与位置 `小节:拍:tick`
@@ -900,9 +1093,20 @@ BPM=0、速度点位置重复、拍号分母不是 2 的幂，会在同一个 42
                "elapsed_seconds": 3.0, "last_elapsed_seconds": 2.0}]}
   ```
 
+  登记批注时提交秒数不等于当前已领取进度也返回 **409**（不写入任何
+  批注）：
+
+  ```json
+  {"detail": [{"loc": ["body", "elapsed_seconds"],
+               "msg": "批注秒数必须等于当前已领取进度：本次 2.5s，已领取进度 3.0s",
+               "index": null,
+               "elapsed_seconds": 2.5, "last_elapsed_seconds": 3.0}]}
+  ```
+
 - **422**：提示位置非法或文字为空（带提示 `index`）、`elapsed_seconds`
   为负或非有限值、提示表为空；定位目标 `position` 非法（按谱例 PPQ/
-  拍号校验）或定位秒数为负/非有限值。
+  拍号校验）或定位秒数为负/非有限值；批注文字为空或批注秒数为负/
+  非有限值。
 
 ---
 
@@ -942,6 +1146,16 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 保留、可继续领取；另含旧版 SQLite 库（无定位起点列）打开时自动迁移、
 旧排练仍按绝对秒数计时的验证。
 
+排练批注测试（`tests/test_annotations.py`）覆盖：登记返回位置/tick
+坐标/修订号（未定位从乐谱起点算、刚定位同一秒落在目标位置、定位后
+按起点相对反推、量化到最近 tick）、秒数不等于进度 409 且不写入、
+负/非有限秒数与空文字 422、未知排练 404、按登记先后查询（与位置
+先后无关）、登记不推进进度也不影响提示、发布与再次定位后既有批注
+冻结而新批注按新修订计算、**多连接登记与领取交错时进度/起点/速度图
+取自同一已提交状态**（落后的登记 409 不写入）、新 Store 实例（模拟
+Compose 重启）后批注仍可读可继续登记，以及旧版库（无 annotations
+表）打开时自动建表。
+
 ## 项目结构
 
 ```
@@ -951,13 +1165,14 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 │   ├── main.py        # FastAPI 路由、请求/响应模型、422/409/404 错误处理
 │   ├── tempo.py       # 核心引擎：拍号展开、积分换算、同段求逆、校验
 │   └── db.py          # SQLite 持久化：谱例/锚点/修订号乐观锁原子发布，
-│                      #   排练/提示/发放/跳过记录，单事务领取与定位
+│                      #   排练/提示/发放/跳过记录，单事务领取、定位与批注登记
 ├── tests/
 │   ├── conftest.py    # 测试用临时 SQLite（TEMPO_DB_PATH）
 │   ├── test_tempo.py  # 引擎数值/往返/校验测试
 │   ├── test_api.py    # /convert 端到端测试
 │   ├── test_scores.py # 修订创建/预览/发布/查询与持久化测试
-│   └── test_rehearsals.py # 排练创建/领取/定位跳过/并发与持久化测试
+│   ├── test_rehearsals.py # 排练创建/领取/定位跳过/并发与持久化测试
+│   └── test_annotations.py # 批注登记/查询/冻结/并发与持久化测试
 ├── Dockerfile
 ├── docker-compose.yml # 命名卷 tempo-data -> /data（TEMPO_DB_PATH）
 ├── requirements.txt
