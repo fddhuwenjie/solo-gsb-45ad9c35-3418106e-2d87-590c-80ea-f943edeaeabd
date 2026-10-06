@@ -19,6 +19,10 @@
 * ``cue_skips``：定位跳过记录（定位时该修订号），主键
   ``(rehearsal_id, cue_index)`` 兜底保证同一提示最多跳过一次，且与
   ``cue_deliveries`` 互斥。
+* ``rehearsal_annotations``：排练现场文字批注（登记先后 ``seq``、
+  非空文字、提交的累计秒数，以及登记瞬间按当前定位起点与当前已提交
+  速度图反推并量化的乐谱位置/tick 与所用修订号——全部冻结，速度图
+  发布或再次定位后保持登记时的值）。
 
 发布是单事务：``BEGIN IMMEDIATE`` 取得写锁后按 revision 做乐观并发控制
 （预期修订号不匹配 -> 409），成功则一次更新速度图、未锁定锚点秒数和
@@ -38,6 +42,15 @@
 速度图：待发提示按最新修订重算触发秒数，而定位起点（tick/累计秒数）、
 已发记录与跳过状态都保持不变。定位/领取/发布共用同一把写锁串行化，
 同一条提示不可能既跳过又发放。
+
+批注登记（``add_annotation``）同样是单事务：提交的累计秒数必须
+**等于**已领取进度（否则 :class:`AnnotationProgressMismatch` -> 409，
+不写入）。校验通过后，在同一 ``BEGIN IMMEDIATE`` 事务快照内把当前
+定位起点（tick/累计秒数）与谱例当前已提交速度图/修订号交给引擎层
+注入的纯计算回调，由它反推出乐谱位置并量化到最近 tick；因此进度、
+起点与速度图必然来自**同一已提交状态**，写入的修订号就是反推所用的
+修订号。位置字符串/tick/修订号在写入时冻结：此后速度图发布或再次
+定位只改变排练当前状态，既有批注各列保持登记时的值。
 
 查询同样是单事务：``GET /scores`` / ``GET /rehearsals`` 在同一显式读
 事务内读取主行与全部明细行，二者共用一个已提交快照，避免与发布/领取
@@ -118,6 +131,20 @@ CREATE TABLE IF NOT EXISTS cue_skips (
     FOREIGN KEY (rehearsal_id, cue_index)
         REFERENCES rehearsal_cues(rehearsal_id, cue_index) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS rehearsal_annotations (
+    rehearsal_id    TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    annotation_id   TEXT NOT NULL UNIQUE,
+    text            TEXT NOT NULL,
+    elapsed_seconds REAL NOT NULL,
+    position        TEXT NOT NULL,
+    total_ticks     INTEGER NOT NULL,
+    revision        INTEGER NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (rehearsal_id, seq),
+    FOREIGN KEY (rehearsal_id) REFERENCES rehearsals(id) ON DELETE CASCADE
+);
 """
 
 
@@ -157,6 +184,18 @@ class OriginMismatch(Exception):
         self.last_elapsed = last_elapsed
         super().__init__(
             f"定位秒数必须等于当前已领取进度：提交 {elapsed}，"
+            f"已领取到 {last_elapsed}"
+        )
+
+
+class AnnotationProgressMismatch(Exception):
+    """批注提交的累计秒数不等于当前已领取进度（-> 409，不写入）。"""
+
+    def __init__(self, elapsed: float, last_elapsed: float):
+        self.elapsed = elapsed
+        self.last_elapsed = last_elapsed
+        super().__init__(
+            f"批注秒数必须等于当前已领取进度：提交 {elapsed}，"
             f"已领取到 {last_elapsed}"
         )
 
@@ -649,6 +688,133 @@ class Store:
             "skipped": sorted(to_skip_set),
             "rehearsal": rehearsal,
         }
+
+    # ------------------------------------------------------------------ #
+    # 排练批注：按当前领取进度登记文字批注并反推乐谱位置（登记时冻结）
+    # ------------------------------------------------------------------ #
+    def add_annotation(
+        self,
+        rehearsal_id: str,
+        elapsed: float,
+        text: str,
+        locate_position: Callable[[dict, float], dict],
+    ) -> dict:
+        """单事务登记一条批注（秒数必须等于当前已领取进度）。
+
+        ``elapsed`` 必须**等于**排练当前已领取进度（``last_elapsed``），
+        否则抛 :class:`AnnotationProgressMismatch`（-> 409），**不写入**；
+        排练不存在 -> :class:`RehearsalNotFound`。
+
+        ``locate_position(score, elapsed)`` 是引擎层注入的纯计算回调：
+        在 ``BEGIN IMMEDIATE`` 事务内、基于本事务快照的当前定位起点
+        （``origin_ticks`` / ``origin_elapsed``）与谱例当前已提交速度图，
+        按 ``elapsed`` 反推出乐谱位置并量化到最近 tick，返回
+        ``{"position", "total_ticks"}``。整个校验-读-算-写在同一写事务
+        内完成，与领取/定位/发布交错时二者必居其一，故**进度、起点与
+        速度图（修订号）必然取自同一已提交状态**，写入的 ``revision``
+        就是反推所用速度图的修订号。位置/tick/修订号写入即冻结，之后
+        的发布或再次定位不修改本条批注。
+
+        ``seq`` 在事务内按该排练既有批注数 +1 分配，登记先后即查询顺序。
+        """
+        annotation_id = new_id()
+        with self._write_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM rehearsals WHERE id = ?", (rehearsal_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise RehearsalNotFound(rehearsal_id)
+            if elapsed != row["last_elapsed"]:
+                conn.rollback()
+                raise AnnotationProgressMismatch(elapsed, row["last_elapsed"])
+
+            score_row = conn.execute(
+                "SELECT * FROM scores WHERE id = ?", (row["score_id"],)
+            ).fetchone()
+            if score_row is None:  # 外键保证不会发生；防御性处理
+                conn.rollback()
+                raise ScoreNotFound(row["score_id"])
+            revision = score_row["revision"]
+            score = {
+                "id": score_row["id"],
+                "ppq": score_row["ppq"],
+                "time_signatures": json.loads(score_row["time_signatures"]),
+                "tempo_points": json.loads(score_row["tempo_points"]),
+                "revision": revision,
+                "origin_ticks": row["origin_ticks"],
+                "origin_elapsed": row["origin_elapsed"],
+            }
+            # 纯计算：同一快照的起点 + 当前已提交速度图反推乐谱位置。
+            located = locate_position(score, elapsed)
+
+            seq_row = conn.execute(
+                "SELECT COALESCE(MAX(seq) + 1, 0) AS next_seq "
+                "FROM rehearsal_annotations WHERE rehearsal_id = ?",
+                (rehearsal_id,),
+            ).fetchone()
+            seq = int(seq_row["next_seq"])
+            conn.execute(
+                "INSERT INTO rehearsal_annotations "
+                "(rehearsal_id, seq, annotation_id, text, elapsed_seconds, "
+                " position, total_ticks, revision) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    rehearsal_id,
+                    seq,
+                    annotation_id,
+                    text,
+                    elapsed,
+                    located["position"],
+                    located["total_ticks"],
+                    revision,
+                ),
+            )
+            conn.commit()
+
+        return {
+            "id": annotation_id,
+            "seq": seq,
+            "text": text,
+            "elapsed_seconds": elapsed,
+            "position": located["position"],
+            "total_ticks": located["total_ticks"],
+            "revision": revision,
+        }
+
+    def list_annotations(self, rehearsal_id: str) -> list[dict]:
+        """按登记先后（``seq`` 升序）返回排练的全部批注。
+
+        单读事务：与登记/发布/定位交错时整次查询取自同一已提交快照；
+        排练不存在抛 :class:`RehearsalNotFound`。批注各列是登记时的
+        冻结值，不随之后的速度图发布或再次定位重算。
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT id FROM rehearsals WHERE id = ?", (rehearsal_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise RehearsalNotFound(rehearsal_id)
+            rows = conn.execute(
+                "SELECT * FROM rehearsal_annotations WHERE rehearsal_id = ? "
+                "ORDER BY seq",
+                (rehearsal_id,),
+            ).fetchall()
+            conn.commit()
+        return [
+            {
+                "id": r["annotation_id"],
+                "text": r["text"],
+                "elapsed_seconds": r["elapsed_seconds"],
+                "position": r["position"],
+                "total_ticks": r["total_ticks"],
+                "revision": r["revision"],
+            }
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------ #
     @staticmethod
